@@ -1,0 +1,52 @@
+# Quick fuzzy-open: pick a file with preview, open in $EDITOR
+ff() {
+  local file
+  file="$(fzf --preview 'bat --style=numbers --color=always --line-range=:300 {}' --bind 'enter:accept')" || return
+  "${EDITOR:-nvim}" "$file"
+}
+
+# Ripgrep + fzf: jump to match in editor at the right line
+rgi() {
+  rg --line-number --no-heading --color=always "$@" \
+  | fzf --ansi --delimiter : \
+        --preview 'bat --style=numbers --color=always --line-range {2}:+200 {1}' \
+        --bind 'enter:accept' \
+  | awk -F: '{print "+"$2" "$1}' \
+  | xargs -r ${EDITOR:-nvim}
+}
+
+# Find directories quickly and cd into them
+jj() {
+  local dir
+  dir="$(fd --type d '' | fzf --preview 'eza -la --group-directories-first {} 2>/dev/null || ls -al {}')" || return
+  cd "$dir"
+}
+
+# Watch a command with better watch
+vw() { viddy -- "$@"; }
+onchange() { fd "$1" | entr -rc $SHELL -lc "${*:2}"; }
+
+# Benchmark two commands
+cmpfast() { hyperfine --warmup 2 "$1" "$2"; }
+
+# Disk usage (pretty)
+alias duks='dust -r'
+alias dfk='duf'
+
+# HTTP: json defaults
+alias hget='http GET'
+alias hpost='http POST'
+alias xget='xh get'
+alias xpost='xh post'
+
+# CSV/TSV: choose column 2 then sort unique
+alias cut2='choose 2 | sort | uniq -c | sort -rn'
+
+# Markdown in terminal
+alias md='glow -p'
+
+# Shell history
+if command -v atuin >/dev/null; then
+  eval "$(atuin init zsh || atuin init bash)"
+  # Ctrl-R becomes fast fuzzy history
+fi

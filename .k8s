@@ -1,0 +1,267 @@
+alias k='kubectl'
+alias kgp='kubectl get pods'
+alias kgs='kubectl get svc'
+alias kgn='kubectl get nodes -o wide'
+alias kga='kubectl get all'
+alias kd='kubectl describe'
+alias kdel='kubectl delete'
+alias kaf='kubectl apply -f'
+alias kak='kubectl apply -k'
+
+if command -v kubectx >/dev/null 2>&1; then
+  kctx() { kubectx "$@"; }
+else
+  kctx() {
+    if [[ -z "$1" ]]; then kubectl config get-contexts; else kubectl config use-context "$1"; fi
+  }
+fi
+
+if command -v kubens >/dev/null 2>&1; then
+  kns() { kubens "$@"; }
+else
+  kns() {
+    if [[ -z "$1" ]]; then
+      kubectl get ns
+    else
+      kubectl config set-context --current --namespace="$1"
+      echo "Namespace set to: $1"
+    fi
+  }
+fi
+
+setns() {
+  if [[ -z "$1" ]]; then
+    echo "Usage: setns <namespace>"
+    return 1
+  fi
+  export KUBE_NAMESPACE="$1"
+  echo "KUBE_NAMESPACE=$KUBE_NAMESPACE"
+}
+
+__k_ns_arg() { [[ -n "$1" ]] && echo "-n" "$1"; }
+__k_list_pods() {
+  local ns="$1"
+  kubectl get pods $(__k_ns_arg "$ns") -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+}
+__k_pick_pod() {
+  local ns="$1" pattern="$2"
+  local pods; pods="$(__k_list_pods "$ns")" || return 1
+  [[ -n "$pattern" ]] && pods="$(printf "%s\n" "$pods" | grep -E "$pattern")"
+  if [[ -z "$pods" ]]; then
+    echo "No pods found${pattern:+ matching \"$pattern\"}." >&2
+    return 1
+  fi
+  if command -v fzf >/dev/null 2>&1; then
+    printf "%s\n" "$pods" | fzf
+  else
+    printf "%s\n" "$pods" | head -n1
+  fi
+}
+
+klog() {
+  local NS="${KUBE_NAMESPACE}" CONTAINER="" FOLLOW=""
+  local OPTIND opt
+  while getopts ":n:c:fh" opt; do
+    case "$opt" in
+      n) NS="$OPTARG" ;;
+      c) CONTAINER="$OPTARG" ;;
+      f) FOLLOW="1" ;;
+      h)
+        echo "Usage: klog [-n ns] [-c container] [-f] [pod-pattern]"
+        return 0
+        ;;
+      \?) echo "Invalid option: -$OPTARG" >&2; return 1 ;;
+    esac
+  done
+  shift $((OPTIND-1))
+  local PATTERN="${1:-}"
+
+  local POD; POD="$(__k_pick_pod "$NS" "$PATTERN")" || return 1
+  kubectl logs $(__k_ns_arg "$NS") ${FOLLOW:+-f} ${CONTAINER:+-c "$CONTAINER"} "$POD"
+}
+
+kexec() {
+  local NS="${KUBE_NAMESPACE}" CONTAINER=""
+  local OPTIND opt
+  while getopts ":n:c:h" opt; do
+    case "$opt" in
+      n) NS="$OPTARG" ;;
+      c) CONTAINER="$OPTARG" ;;
+      h)
+        echo "Usage: kexec [-n ns] [-c container] [pod-pattern] [-- cmd…]"
+        return 0
+        ;;
+      \?) echo "Invalid option: -$OPTARG" >&2; return 1 ;;
+    esac
+  done
+  shift $((OPTIND-1))
+
+  local PATTERN=""
+  if [[ -n "${1:-}" && "$1" != "--" ]]; then
+    PATTERN="$1"; shift
+  fi
+  [[ "${1:-}" == "--" ]] && shift
+  local POD; POD="$(__k_pick_pod "$NS" "$PATTERN")" || return 1
+
+  if [[ $# -gt 0 ]]; then
+    kubectl exec -it $(__k_ns_arg "$NS") ${CONTAINER:+-c "$CONTAINER"} "$POD" -- "$@"
+  else
+    kubectl exec -it $(__k_ns_arg "$NS") ${CONTAINER:+-c "$CONTAINER"} "$POD" -- bash -l 2>/dev/null \
+      || kubectl exec -it $(__k_ns_arg "$NS") ${CONTAINER:+-c "$CONTAINER"} "$POD" -- sh -l
+  fi
+}
+
+kpf() {
+  local NS="${KUBE_NAMESPACE}"
+  local OPTIND opt
+  while getopts ":n:h" opt; do
+    case "$opt" in
+      n) NS="$OPTARG" ;;
+      h)
+        echo "Usage: kpf [-n ns] [pod-pattern] <local:remote>"
+        return 0
+        ;;
+      \?) echo "Invalid option: -$OPTARG" >&2; return 1 ;;
+    esac
+  done
+  shift $((OPTIND-1))
+
+  local PATTERN="" PORTS=""
+  if [[ $# -eq 1 ]]; then
+    PORTS="$1"
+  else
+    PATTERN="${1:-}"
+    PORTS="${2:-}"
+  fi
+  if [[ -z "$PORTS" ]]; then
+    echo "Missing ports. Example: kpf -n staging web 8080:80" >&2
+    return 1
+  fi
+  local POD; POD="$(__k_pick_pod "$NS" "$PATTERN")" || return 1
+  echo "Forwarding: $PORTS -> $POD ${NS:+(ns: $NS)}"
+  kubectl port-forward $(__k_ns_arg "$NS") "$POD" "$PORTS"
+}
+
+kw() {
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: kw <resource> [args...]   (e.g., kw pods -n staging)" >&2
+    return 1
+  fi
+  kubectl get "$@" -w
+}
+
+kdecode() {
+  local NS="${KUBE_NAMESPACE}"
+  if [[ "$1" == "-n" ]]; then NS="$2"; shift 2; fi
+  local name="$1"
+  if [[ -z "$name" ]]; then echo "Usage: kdecode [-n ns] <secret>"; return 1; fi
+  kubectl get secret "$name" $(__k_ns_arg "$NS") -o json \
+    | jq -r '.data | to_entries[] | "\(.key)=\(.value|@base64d)"'
+}
+
+kimg() {
+  local NS="${KUBE_NAMESPACE}" DEPLOY=""
+  if [[ "$1" == "-n" ]]; then NS="$2"; shift 2; fi
+  DEPLOY="$1"
+  if [[ -z "$DEPLOY" ]]; then echo "Usage: kimg [-n ns] <deployment>"; return 1; fi
+  kubectl get deploy "$DEPLOY" $(__k_ns_arg "$NS") -o json \
+    | jq -r '.spec.template.spec.containers[].image'
+}
+
+kdelp() {
+  local NS="${KUBE_NAMESPACE}" regex="$1"
+  if [[ "$1" == "-n" ]]; then NS="$2"; regex="$3"; fi
+  if [[ -z "$regex" ]]; then echo "Usage: kdelp [-n ns] <regex>"; return 1; fi
+  local pods; pods="$(__k_list_pods "$NS" | grep -E "$regex")"
+  if [[ -z "$pods" ]]; then echo "No pods match '$regex'."; return 0; fi
+  echo "Delete these pods${NS:+ in ns $NS}?"; printf "%s\n" "$pods"
+  read -r -p "Type 'yes' to confirm: " ans
+  [[ "$ans" == "yes" ]] || { echo "Aborted."; return 1; }
+  printf "%s\n" "$pods" | xargs -I{} kubectl delete pod $(__k_ns_arg "$NS") "{}"
+}
+
+ktail() {
+  if ! command -v stern >/dev/null 2>&1; then
+    echo "stern not installed. Try: brew install stern" >&2; return 1
+  fi
+  local NS="${KUBE_NAMESPACE}" regex=""
+  if [[ "$1" == "-n" ]]; then NS="$2"; shift 2; fi
+  regex="${1:-.}"
+  stern "$regex" $(__k_ns_arg "$NS")
+}
+
+if command -v kubectl >/dev/null 2>&1; then
+  if [[ -n "$BASH_VERSION" ]]; then
+    source <(kubectl completion bash)
+    complete -o default -F __start_kubectl k
+  elif [[ -n "$ZSH_VERSION" ]]; then
+    autoload -Uz compinit && compinit
+    source <(kubectl completion zsh)
+    compdef k=kubectl
+  fi
+fi
+
+kaitoken() {
+  local NS="${KUBE_NAMESPACE}" CONTAINER="" PRINT="" DECODE=""
+  local OPTIND opt
+  while getopts ":n:c:pdh" opt; do
+    case "$opt" in
+      n) NS="$OPTARG" ;;
+      c) CONTAINER="$OPTARG" ;;
+      p) PRINT="1" ;;
+      d) DECODE="1" ;;
+      h)
+        echo "Usage: kaitoken [-n ns] [-c container] [-p | -d] [pod-pattern]"
+        return 0
+        ;;
+      \?) echo "Invalid option: -$OPTARG" >&2; return 1 ;;
+    esac
+  done
+  shift $((OPTIND-1))
+
+  local PATTERN="${1:-}"
+  local POD; POD="$(__k_pick_pod "$NS" "$PATTERN")" || return 1
+
+  local TOKEN_PATH="/var/run/secrets/azure/tokens/azure-identity-token"
+  local TOKEN
+  TOKEN="$(kubectl exec -i $(__k_ns_arg "$NS") ${CONTAINER:+-c "$CONTAINER"} "$POD" -- /bin/sh -lc "cat '$TOKEN_PATH'" 2>/dev/null | tr -d '\r')" || return 1
+  [[ -z "$TOKEN" ]] && { echo "No token at $TOKEN_PATH for pod $POD${NS:+ (ns $NS)}"; return 1; }
+
+  if [[ -n "$DECODE" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      printf "%s" "$TOKEN" | python3 - "$POD" <<'PY'
+import sys, json, base64
+tok = sys.stdin.read().strip()
+parts = tok.split('.')
+if len(parts) < 2:
+    sys.exit("Not a JWT (expected header.payload.signature).")
+def b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+try:
+    hdr = json.loads(b64url_decode(parts[0]))
+    pay = json.loads(b64url_decode(parts[1]))
+except Exception as e:
+    sys.exit(f"Failed to decode JWT: {e}")
+print("Header:")
+print(json.dumps(hdr, indent=2))
+print("\nPayload:")
+print(json.dumps(pay, indent=2))
+PY
+    else
+      echo "python3 not found for safe JWT decode. Install Python or use -p to print raw."
+      return 1
+    fi
+  else
+    if [[ -n "$PRINT" ]]; then
+      printf "%s\n" "$TOKEN"
+    else
+      if command -v pbcopy >/dev/null 2>&1; then
+        printf "%s" "$TOKEN" | pbcopy
+        echo "(token copied to clipboard)"
+      else
+        printf "%s\n" "$TOKEN"
+      fi
+    fi
+  fi
+}
+alias kitoken='kaitoken'

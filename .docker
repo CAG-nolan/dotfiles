@@ -1,0 +1,262 @@
+alias d='docker'
+alias di='docker images'
+alias dimg='docker images'
+alias dnet='docker network ls'
+alias dv='docker volume ls'
+alias dctx='docker context ls'
+alias dc='docker compose'
+
+__d_list_containers() {
+  if [[ "$1" == "all" ]]; then
+    docker ps -a --format '{{.Names}}'
+  else
+    docker ps --format '{{.Names}}'
+  fi
+}
+__d_pick_container() {
+  local scope="$1" pattern="${2:-}"
+  local items; items="$(__d_list_containers "$scope")" || return 1
+  [[ -n "$pattern" ]] && items="$(printf "%s\n" "$items" | grep -E "$pattern")"
+  [[ -z "$items" ]] && { echo "No containers${pattern:+ matching \"$pattern\"}." >&2; return 1; }
+  if command -v fzf >/dev/null 2>&1; then
+    printf "%s\n" "$items" | fzf
+  else
+    printf "%s\n" "$items" | head -n1
+  fi
+}
+__d_list_images() {
+  docker images --format '{{.Repository}}:{{.Tag}}'
+}
+__d_pick_image() {
+  local pattern="${1:-}"
+  local imgs; imgs="$(__d_list_images)"
+  [[ -n "$pattern" ]] && imgs="$(printf "%s\n" "$imgs" | grep -E "$pattern")"
+  [[ -z "$imgs" ]] && { echo "No images${pattern:+ matching \"$pattern\"}." >&2; return 1; }
+  if command -v fzf >/dev/null 2>&1; then printf "%s\n" "$imgs" | fzf; else printf "%s\n" "$imgs" | head -n1; fi
+}
+
+dps() {
+  local ALL="" QUIET=""
+  local OPTIND opt
+  while getopts ":aqh" opt; do
+    case "$opt" in
+      a) ALL="-a" ;;
+      q) QUIET="-q" ;;
+      h) echo "Usage: dps [-a] [-q]"; return 0 ;;
+      *) return 1 ;;
+    esac
+  done; shift $((OPTIND-1))
+  if [[ -n "$QUIET" ]]; then
+    docker ps $ALL -q
+  else
+    docker ps $ALL --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.RunningFor}}\t{{.Ports}}'
+  fi
+}
+
+dlog() {
+  local SCOPE="" FOLLOW="" LINES="200" TS=""
+  local OPTIND opt
+  while getopts ":afn:th" opt; do
+    case "$opt" in
+      a) SCOPE="all" ;;
+      f) FOLLOW="-f" ;;
+      n) LINES="$OPTARG" ;;
+      t) TS="--timestamps" ;;
+      h) echo "Usage: dlog [-a] [-f] [-n lines] [-t] [name-pattern]"; return 0 ;;
+      *) return 1 ;;
+    esac
+  done; shift $((OPTIND-1))
+  local PATTERN="${1:-}"
+  local C; C="$(__d_pick_container "$SCOPE" "$PATTERN")" || return 1
+  docker logs $FOLLOW --tail "$LINES" $TS "$C"
+}
+
+dexec() {
+  local SCOPE="" USER="" WORKDIR=""
+  local OPTIND opt
+  while getopts ":au:w:h" opt; do
+    case "$opt" in
+      a) SCOPE="all" ;;
+      u) USER="--user $OPTARG" ;;
+      w) WORKDIR="--workdir $OPTARG" ;;
+      h) echo "Usage: dexec [-a] [-u user] [-w dir] [name-pattern] [-- cmd...]"; return 0 ;;
+      *) return 1 ;;
+    esac
+  done; shift $((OPTIND-1))
+
+  local PATTERN=""
+  if [[ -n "${1:-}" && "$1" != "--" ]]; then PATTERN="$1"; shift; fi
+  [[ "${1:-}" == "--" ]] && shift
+  local C; C="$(__d_pick_container "$SCOPE" "$PATTERN")" || return 1
+
+  if [[ $# -gt 0 ]]; then
+    docker exec -it $USER $WORKDIR "$C" "$@"
+  else
+    docker exec -it $USER $WORKDIR "$C" bash -l 2>/dev/null || docker exec -it $USER $WORKDIR "$C" sh -l
+  fi
+}
+dsh() { dexec "$@"; }
+
+dstop()   { local C; C="$(__d_pick_container all "${1:-}")" || return 1; docker stop "$C"; }
+dstart()  { local C; C="$(__d_pick_container all "${1:-}")" || return 1; docker start "$C"; }
+drestart(){ local C; C="$(__d_pick_container all "${1:-}")" || return 1; docker restart "$C"; }
+drm()     { local C; C="$(__d_pick_container all "${1:-}")" || return 1; docker rm "$C"; }
+
+drmrx() {
+  local regex="${1:-}"
+  [[ -z "$regex" ]] && { echo "Usage: drmrx <regex>"; return 1; }
+  local list; list="$(docker ps -a --format '{{.Names}}' | grep -E "$regex")"
+  [[ -z "$list" ]] && { echo "No containers match '$regex'."; return 0; }
+  echo "Remove these containers?"; printf "%s\n" "$list"
+  read -r -p "Type 'yes' to confirm: " ans
+  [[ "$ans" == "yes" ]] || { echo "Aborted."; return 1; }
+  printf "%s\n" "$list" | xargs -I{} docker rm "{}"
+}
+
+dimpick() { __d_pick_image "${1:-}"; }
+
+dtag() {
+  local SRC="${1:-}"; local DST="${2:-}"
+  [[ -z "$SRC" ]] && SRC="$(dimpick || true)"
+  [[ -z "$SRC" ]] && { echo "No source image chosen."; return 1; }
+  if [[ -z "$DST" ]]; then echo "Usage: dtag <src> <dst>"; return 1; fi
+  docker tag "$SRC" "$DST"
+}
+
+dpush() { local IMG="${1:-}"; [[ -z "$IMG" ]] && IMG="$(dimpick || true)"; [[ -z "$IMG" ]] && { echo "No image chosen."; return 1; }; docker push "$IMG"; }
+dpull() { local IMG="${1:-}"; [[ -z "$IMG" ]] && IMG="$(dimpick || true)"; [[ -z "$IMG" ]] && { echo "No image chosen."; return 1; }; docker pull "$IMG"; }
+
+dsave() {
+  local IMG="${1:-}" OUT="${2:-}"
+  [[ -z "$IMG" ]] && IMG="$(dimpick || true)"
+  [[ -z "$IMG" ]] && { echo "No image chosen."; return 1; }
+  [[ -z "$OUT" ]] && OUT="$(echo "$IMG" | tr '/:' '__').tar"
+  echo "Saving $IMG -> $OUT"
+  docker save -o "$OUT" "$IMG"
+  echo "Wrote $(du -h "$OUT" | awk '{print $1}')"
+}
+dload() { [[ -z "$1" ]] && { echo "Usage: dload <image.tar>"; return 1; }; docker load -i "$1"; }
+
+dclean() {
+  echo "Pruning stopped containers, dangling images, unused networks/volumes..."
+  docker system prune -f
+  docker volume prune -f
+  echo "Done."
+}
+
+dinspect() { local C; C="$(__d_pick_container all "${1:-}")" || return 1; docker inspect "$C" | jq .; }
+dip()      { local C; C="$(__d_pick_container all "${1:-}")" || return 1; docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$C"; }
+
+dports() {
+  local C; C="$(__d_pick_container all "${1:-}")" || return 1
+  echo "Container: $C"
+  docker port "$C"
+}
+
+dcpin() {
+  local SRC="${1:-}" DEST="${2:-}"
+  [[ -z "$SRC" || -z "$DEST" ]] && { echo "Usage: dcpin <local> [name]:<path-in-container>"; return 1; }
+  local NAME PART PATHIN
+  if [[ "$DEST" == *:* ]]; then
+    NAME="${DEST%%:*}" ; PATHIN="${DEST#*:}"
+  else
+    echo "DEST must be in the form name:/path"; return 1
+  fi
+  [[ -z "$NAME" ]] && NAME="$(__d_pick_container all || true)"
+  [[ -z "$NAME" ]] && { echo "No container chosen."; return 1; }
+  docker cp "$SRC" "$NAME":"$PATHIN"
+}
+dcpout() {
+  local SRC="${1:-}" DEST="${2:-}"
+  [[ -z "$SRC" || -z "$DEST" ]] && { echo "Usage: dcpout [name]:<path-in-container> <local>"; return 1; }
+  local NAME PATHIN
+  if [[ "$SRC" == *:* ]]; then
+    NAME="${SRC%%:*}" ; PATHIN="${SRC#*:}"
+  else
+    echo "SRC must be in the form name:/path"; return 1
+  fi
+  [[ -z "$NAME" ]] && NAME="$(__d_pick_container all || true)"
+  [[ -z "$NAME" ]] && { echo "No container chosen."; return 1; }
+  docker cp "$NAME":"$PATHIN" "$DEST"
+}
+
+dbuild() {
+  local TAG="" FILE=""
+  local OPTIND opt
+  while getopts ":t:f:h" opt; do
+    case "$opt" in
+      t) TAG="-t $OPTARG" ;;
+      f) FILE="-f $OPTARG" ;;
+      h) echo "Usage: dbuild [-t tag] [-f Dockerfile] [context]"; return 0 ;;
+      *) return 1 ;;
+    esac
+  done; shift $((OPTIND-1))
+  local CTX="${1:-.}"
+  DOCKER_BUILDKIT=1 docker build $FILE $TAG "$CTX"
+}
+
+drun() {
+  local PORTS=() VOLS=() ENVS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p) PORTS+=("$1" "$2"); shift 2 ;;
+      -v) VOLS+=("$1" "$2"); shift 2 ;;
+      -e) ENVS+=("$1" "$2"); shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  local IMG="${1:-}"; shift || true
+  [[ -z "$IMG" ]] && { echo "Usage: drun [-p h:c] [-v h:c] [-e K=V] -- <image> [cmd...]"; return 1; }
+  docker run --rm -it "${PORTS[@]}" "${VOLS[@]}" "${ENVS[@]}" "$IMG" "$@"
+}
+
+dxls() { docker buildx ls; }
+dxuse() { docker buildx use "${1:-default}"; }
+dxcreate() { docker buildx create --name "${1:-devbuilder}" --use --bootstrap; }
+dxbuild() {
+  local TAG="" PUSH=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t) TAG="-t $2"; shift 2 ;;
+      --push) PUSH="--push"; shift ;;
+      *) break ;;
+    esac
+  done
+  local CTX="${1:-.}"
+  DOCKER_BUILDKIT=1 docker buildx build --platform linux/amd64,linux/arm64 $TAG $PUSH "$CTX"
+}
+
+# dcup [-d] [services...] ; dcd (down); dcl [-f] [service]
+dcup()   { docker compose up "$@"; }
+dcd()    { docker compose down "$@"; }
+dcl()    { docker compose logs -f "$@"; }
+dcb()    { docker compose build "$@"; }
+dcpull() { docker compose pull "$@"; }
+dcr()    { docker compose restart "$@"; }
+
+__dc_pick_service() {
+  local list; list="$(docker compose ps --services 2>/dev/null)"
+  [[ -z "$list" ]] && { echo "No compose services found (are you in the right directory?)." >&2; return 1; }
+  if command -v fzf >/dev/null 2>&1; then printf "%s\n" "$list" | fzf; else printf "%s\n" "$list" | head -n1; fi
+}
+dcexec() {
+  local SVC="${1:-}"; [[ -n "$SVC" && "$SVC" != "--" ]] && shift || SVC="$(__dc_pick_service)" || return 1
+  [[ "${1:-}" == "--" ]] && shift
+  if [[ $# -gt 0 ]]; then docker compose exec "$SVC" "$@"; else docker compose exec "$SVC" bash -l 2>/dev/null || docker compose exec "$SVC" sh -l; fi
+}
+dclogs() {
+  local SVC="${1:-}"; [[ -z "$SVC" ]] && SVC="$(__dc_pick_service)" || true
+  docker compose logs -f ${SVC:+$SVC}
+}
+
+if command -v docker >/dev/null 2>&1; then
+  if [[ -n "$BASH_VERSION" ]]; then
+    source <(docker completion bash) 2>/dev/null || true
+    complete -o default -F _docker d
+  elif [[ -n "$ZSH_VERSION" ]]; then
+    autoload -Uz compinit && compinit
+    source <(docker completion zsh) 2>/dev/null || true
+    compdef d=docker
+  fi
+fi
