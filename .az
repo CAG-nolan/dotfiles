@@ -1,0 +1,144 @@
+alias azs='az account show -o table'
+alias azsubs='az account list -o table'
+alias azrgs='az group list -o table'
+alias azext='az extension list -o table'
+alias azlogin='az login >/dev/null && echo "Logged in."'
+
+# Remember “sticky” defaults for other helpers
+export AZ_SUB=""   # subscription id
+export AZ_RG=""    # resource group
+export AZ_LOC=""   # region, e.g., eastus
+
+# --- tiny utils ---
+__has() { command -v "$1" >/dev/null 2>&1; }
+
+__fzf_or_first() {
+  # read list on stdin; use fzf if present, else first line
+  if __has fzf; then fzf; else head -n1; fi
+}
+
+# --- subscription / rg / location context ---
+setsub() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && id="$(az account list -o tsv --query "[].{name:name,id:id}" \
+                    | awk -F'\t' '{print $1 "\t" $2}' | __fzf_or_first | awk '{print $NF}')"
+  [[ -z "$id" ]] && { echo "No subscription chosen."; return 1; }
+  az account set --subscription "$id" && export AZ_SUB="$id"
+  echo "AZ_SUB=$AZ_SUB"
+}
+setrg() {
+  local rg="${1:-}"
+  [[ -z "$rg" ]] && rg="$(az group list -o tsv --query "[].name" | __fzf_or_first)"
+  [[ -z "$rg" ]] && { echo "No resource group chosen."; return 1; }
+  export AZ_RG="$rg"; echo "AZ_RG=$AZ_RG"
+}
+setloc() {
+  local loc="${1:-}"; [[ -z "$loc" ]] && { echo "Usage: setloc <azure-region>"; return 1; }
+  export AZ_LOC="$loc"; echo "AZ_LOC=$AZ_LOC"
+}
+azctx() {
+  echo "Current:"
+  az account show -o table
+  echo "Defaults: AZ_SUB=${AZ_SUB:-<unset>} AZ_RG=${AZ_RG:-<unset>} AZ_LOC=${AZ_LOC:-<unset>}"
+}
+
+# --- AKS: switch kubectl to a cluster quickly ---
+# aksctx [-g rg] [-n name] [--overwrite]
+aksctx() {
+  local RG="${AZ_RG}" NAME="" OVER=""
+  local OPTIND opt
+  while getopts ":g:n:Oh" opt; do
+    case "$opt" in
+      g) RG="$OPTARG" ;;
+      n) NAME="$OPTARG" ;;
+      O) OVER="--overwrite-existing" ;;
+      h) echo "Usage: aksctx [-g rg] [-n name] [-O]"; return 0 ;;
+    esac
+  done
+  shift $((OPTIND-1))
+
+  [[ -z "$NAME" ]] && NAME="$(az aks list ${RG:+-g "$RG"} -o tsv --query "[].{n:name,rg:resourceGroup}" \
+                        | awk -F'\t' '{print $2 "/" $1}' | __fzf_or_first | awk -F'/' '{print $2; rg=$1}')"
+
+  # If NAME was selected as "rg/name", split it
+  if [[ "$NAME" == */* ]]; then RG="${NAME%%/*}"; NAME="${NAME##*/}"; fi
+  [[ -z "$RG" || -z "$NAME" ]] && { echo "Need -g <rg> and -n <name> (or pick one)."; return 1; }
+
+  echo "Fetching kubeconfig for $RG/$NAME..."
+  az aks get-credentials -g "$RG" -n "$NAME" ${OVER:+$OVER}
+}
+
+# --- ACR helpers ---
+# acrlogin [registryName]
+acrlogin() {
+  local REG="${1:-}"
+  [[ -z "$REG" ]] && REG="$(az acr list -o tsv --query '[].name' | __fzf_or_first)"
+  [[ -z "$REG" ]] && { echo "No registry chosen."; return 1; }
+  az acr login -n "$REG"
+}
+acrrepos() {
+  local REG="${1:-}"; [[ -z "$REG" ]] && REG="$(az acr list -o tsv --query '[].name' | __fzf_or_first)"
+  [[ -z "$REG" ]] && { echo "No registry chosen."; return 1; }
+  az acr repository list -n "$REG" -o table
+}
+acrtags() {
+  local REG="${1:-}" REPO="${2:-}"
+  [[ -z "$REG"  ]] && REG="$(az acr list -o tsv --query '[].name' | __fzf_or_first)"
+  [[ -z "$REPO" ]] && REPO="$(az acr repository list -n "$REG" -o tsv | __fzf_or_first)"
+  [[ -z "$REG" || -z "$REPO" ]] && { echo "Need registry and repo."; return 1; }
+  az acr repository show-tags -n "$REG" --repository "$REPO" -o table
+}
+
+# --- Key Vault secrets (copy to clipboard by default, safer) ---
+# kvget [-v vault] <secret> [--print]
+kvget() {
+  local VAULT="" NAME="" PRINT=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -v) VAULT="$2"; shift 2 ;;
+      --print) PRINT="1"; shift ;;
+      *) NAME="$1"; shift ;;
+    esac
+  done
+  [[ -z "$NAME" ]] && { echo "Usage: kvget [-v vault] <secret> [--print]"; return 1; }
+  [[ -z "$VAULT" ]] && VAULT="$(az keyvault list -o tsv --query '[].name' | __fzf_or_first)"
+  [[ -z "$VAULT" ]] && { echo "No vault chosen."; return 1; }
+  local val; val="$(az keyvault secret show --vault-name "$VAULT" -n "$NAME" --query value -o tsv 2>/dev/null)" || return 1
+  if [[ -n "$PRINT" ]]; then
+    echo "$val"
+  else
+    printf "%s" "$val" | pbcopy && echo "(secret copied to clipboard)"
+  fi
+}
+
+# --- Storage (uses login auth; set default account with saset) ---
+saset() { export AZ_SA="$1"; echo "AZ_SA=$AZ_SA"; }
+# blobup [-c container] <local> [remoteName]
+blobup() {
+  local C="" SRC="" DST=""
+  while [[ $# -gt 0 ]]; do case "$1" in -c) C="$2"; shift 2 ;; *) break ;; esac; done
+  SRC="$1"; DST="${2:-$(basename "$SRC")}"
+  [[ -z "$AZ_SA" || -z "$C" || -z "$SRC" ]] && { echo "Usage: saset <account>; blobup -c <container> <local> [name]"; return 1; }
+  az storage blob upload --auth-mode login --account-name "$AZ_SA" -c "$C" -f "$SRC" -n "$DST" -o table
+}
+# blobdown [-c container] <blob> [localPath]
+blobdown() {
+  local C="" BLOB="" OUT=""
+  while [[ $# -gt 0 ]]; do case "$1" in -c) C="$2"; shift 2 ;; *) break ;; esac; done
+  BLOB="$1"; OUT="${2:-$BLOB}"
+  [[ -z "$AZ_SA" || -z "$C" || -z "$BLOB" ]] && { echo "Usage: saset <account>; blobdown -c <container> <blob> [out]"; return 1; }
+  az storage blob download --auth-mode login --account-name "$AZ_SA" -c "$C" -n "$BLOB" -f "$OUT" -o table
+}
+
+# --- VM quick SSH (assumes SSH keys & public IPs) ---
+# azssh → pick a VM, ssh to it
+azssh() {
+  local line; line="$(az vm list-ip-addresses -o tsv \
+            --query "[].{name:virtualMachine.name,rg:virtualMachine.resourceGroup,ip:virtualMachine.network.publicIpAddresses[0].ipAddress}" \
+            | awk -F'\t' '{printf "%s\t%s\t%s\n",$1,$2,$3}' | __fzf_or_first)"
+  [[ -z "$line" ]] && { echo "No VM chosen."; return 1; }
+  local NAME RG IP; NAME="$(echo "$line" | awk '{print $1}')" ; RG="$(echo "$line" | awk '{print $2}')" ; IP="$(echo "$line" | awk '{print $3}')"
+  [[ -z "$IP" ]] && { echo "VM has no public IP."; return 1; }
+  echo "ssh $NAME ($IP) ..."
+  ssh "azureuser@$IP"
+}
